@@ -1,0 +1,7 @@
+torch
+torchvision
+numpy
+matplotlib
+tqdm
+opencv-python-headless # for image reading (headless version for no GUI)
+tensorboard
