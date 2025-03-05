@@ -1,19 +1,29 @@
-# 数据集路径
+# config.py
+import os
+
+# Data paths
 DATA_DIR = 'data/captcha_get'
 
-# 图像大小
+# Image dimensions
 IMG_WIDTH = 90
 IMG_HEIGHT = 34
 
-# 字符集
+# Character set
 CHARS = '0123456789'
 NUM_CHARS = len(CHARS)
 
-# 训练参数
-BATCH_SIZE = 32
-EPOCHS = 50 #可以先尝试50轮，然后根据结果调整。
+# Training parameters
+BATCH_SIZE = 128  # Increased batch size for faster training
+EPOCHS = 50
 LEARNING_RATE = 0.001
-DEVICE = 'cuda'  # 或 'cpu'
+LR_SCHEDULER_STEP = 10
+LR_SCHEDULER_GAMMA = 0.5
 
-# 模型保存路径
-MODEL_PATH = 'checkpoints/model.pth'
+# Web monitoring
+MONITOR_PORT = 8080
+MONITOR_HOST = "0.0.0.0"
+
+# Checkpoints
+CHECKPOINT_DIR = 'checkpoints'
+MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'model.pth')
+BEST_MODEL_PATH = os.path.join(CHECKPOINT_DIR, 'best_model.pth')

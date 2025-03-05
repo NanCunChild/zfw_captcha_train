@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Training Monitor</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        /* (之前的CSS样式保持不变) */
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .header h1 {
+            margin: 0;
+        }
+        .status {
+            background-color: #fff;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .charts {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .chart-container {
+            background-color: #fff;
+            border-radius: 5px;
+            padding: 15px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .hardware {
+            background-color: #fff;
+            border-radius: 5px;
+            padding: 15px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .progress-bar {
+            height: 20px;
+            background-color: #e0e0e0;
+            border-radius: 10px;
+            margin-bottom: 10px;
+        }
+        .progress {
+            height: 100%;
+            background-color: #4caf50;
+            border-radius: 10px;
+            transition: width 0.3s ease;
+        }
+        @media (max-width: 768px) {
+            .charts {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Captcha Recognition Training Monitor</h1>
+            <button id="tb-button" onclick="window.open(tbUrl, '_blank')">Open TensorBoard</button>
+        </div>
+
+        <div class="status" id="status-container">
+            <h2>Training Status</h2>
+            <p>Status: <span id="status">Initializing...</span></p>
+            <p>Epoch: <span id="epoch">0</span> / <span id="total-epochs">50</span></p>
+            <p>Current Step: <span id="step">0</span></p>
+            <p>Estimated Time Remaining: <span id="eta">-</span></p>
+        </div>
+
+        <div class="charts">
+            <div class="chart-container">
+                <canvas id="loss-chart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="accuracy-chart"></canvas>
+            </div>
+            <div class="chart-container">
+                <canvas id="lr-chart"></canvas>
+            </div>
+        </div>
+
+        <div class="hardware" id="hardware-container">
+            <h2>Hardware Utilization</h2>
+            <div id="gpu-container"></div>
+            <div id="memory-container">
+                <h3>System Memory</h3>
+                <div class="progress-bar">
+                    <div class="progress" id="memory-progress" style="width: 0%;"></div>
+                </div>
+                <p><span id="memory-used">0</span> GB / <span id="memory-total">0</span> GB (<span id="memory-percent">0</span>%)</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let tbUrl = '';  // Variable to store TensorBoard URL
+
+        // Function to format time (seconds) into HH:MM:SS
+        function formatTime(seconds) {
+          if (isNaN(seconds) || seconds === Infinity) {
+            return '-';
+          }
+          const h = Math.floor(seconds / 3600);
+          const m = Math.floor((seconds % 3600) / 60);
+          const s = Math.floor(seconds % 60);
+          return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+        }
+
+        // Initialize charts (same as before)
+        const lossChart = new Chart(document.getElementById('loss-chart'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Train Loss',
+                        data: [],
+                        borderColor: 'rgb(75, 192, 192)',
+                        tension: 0.1
+                    },
+                    {
+                        label: 'Validation Loss',
+                        data: [],
+                        borderColor: 'rgb(255, 99, 132)',
+                        tension: 0.1
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Loss'
+                    }
+                }
+            }
+        });
+
+        const accuracyChart = new Chart(document.getElementById('accuracy-chart'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Train Accuracy',
+                        data: [],
+                        borderColor: 'rgb(75, 192, 192)',
+                        tension: 0.1
+                    },
+                    {
+                        label: 'Validation Accuracy',
+                        data: [],
+                        borderColor: 'rgb(255, 99, 132)',
+                        tension: 0.1
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Accuracy'
+                    }
+                }
+            }
+        });
+
+        const lrChart = new Chart(document.getElementById('lr-chart'), {
+            type: 'line',
+            data: {
+                labels: [],
+                datasets: [
+                    {
+                        label: 'Learning Rate',
+                        data: [],
+                        borderColor: 'rgb(153, 102, 255)',
+                        tension: 0.1
+                    }
+                ]
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    title: {
+                        display: true,
+                        text: 'Learning Rate'
+                    }
+                }
+            }
+        });
+
+
+        function updateHardwareInfo(data) {
+            // Update GPU info
+            const gpuContainer = document.getElementById('gpu-container');
+            gpuContainer.innerHTML = '<h3>GPUs</h3>';
+
+            if (data.gpu_usage && data.gpu_usage.length > 0) {
+                data.gpu_usage.forEach(gpu => {
+                    const gpuElement = document.createElement('div');
+                    gpuElement.innerHTML = `
+                        <h4>${gpu.name} (GPU ${gpu.id})</h4>
+                        <div class="progress-bar">
+                            <div class="progress" style="width: ${gpu.utilization}%;"></div>
+                        </div>
+                        <p>Utilization: ${gpu.utilization}%</p>
+                        <p>Memory: ${gpu.memory_used.toFixed(2)} GB / ${gpu.memory_total.toFixed(2)} GB</p>
+                    `;
+                    gpuContainer.appendChild(gpuElement);
+                });
+            } else {
+                gpuContainer.innerHTML += '<p>No GPU detected or data unavailable.</p>';
+            }
+
+            // Update memory info
+            if (data.memory_usage) {
+              document.getElementById('memory-progress').style.width = `${data.memory_usage.percent}%`;
+              document.getElementById('memory-used').textContent = data.memory_usage.used.toFixed(2);
+              document.getElementById('memory-total').textContent = data.memory_usage.total.toFixed(2);
+              document.getElementById('memory-percent').textContent = data.memory_usage.percent.toFixed(1);
+            }
+
+        }
+
+        // Update data from API
+        function updateMetrics() {
+            fetch('/api/metrics')
+                .then(response => response.json())
+                .then(data => {
+                    // Update status
+                    document.getElementById('status').textContent = data.status;
+                    document.getElementById('epoch').textContent = data.epoch;
+                    document.getElementById('step').textContent = data.step;
+                    document.getElementById('eta').textContent = formatTime(data.eta);
+                    document.getElementById('total-epochs').textContent = data.total_epochs
+
+                    // Update charts
+                    const epochs = Array.from({length: data.train_loss.length}, (_, i) => i + 1);
+
+                    lossChart.data.labels = epochs;
+                    lossChart.data.datasets[0].data = data.train_loss;
+                    lossChart.data.datasets[1].data = data.val_loss;
+                    lossChart.update();
+
+                    accuracyChart.data.labels = epochs;
+                    accuracyChart.data.datasets[0].data = data.train_acc;
+                    accuracyChart.data.datasets[1].data = data.val_acc;
+                    accuracyChart.update();
+
+                    lrChart.data.labels = epochs;
+                    lrChart.data.datasets[0].data = data.learning_rate;
+                    lrChart.update();
+
+
+                    // Update hardware info
+                    updateHardwareInfo(data);
+                })
+                .catch(error => console.error('Error fetching metrics:', error));
+        }
+        // Fetch TensorBoard URL from server
+        fetch('/api/metrics') //  Using the same endpoint to get tb_url
+            .then(response => response.json())
+            .then(data => {
+                tbUrl = data.tb_url; // Get tb_url from the server
+                document.getElementById('tb-button').disabled = false; // Enable the button
+            })
+            .catch(error => {
+                console.error('Error fetching TensorBoard URL:', error);
+                document.getElementById('tb-button').textContent = 'TB URL Error';
+            });
+
+        // Update metrics every second
+        setInterval(updateMetrics, 1000);
+
+    </script>
+</body>
+</html>
