@@ -8,16 +8,24 @@ experiment-tracking platform. Pick a model size with ``--variant``:
     python src/train.py --variant small     # ~3MB  pth
     python src/train.py --variant medium    # ~10MB pth
     python src/train.py --variant large     # full ResNet-18 backbone (no cap)
+
+You can also produce several artifacts in a single command:
+
+    # Sequential (each variant uses every available GPU via DDP):
+    python src/train.py --variants tiny,small,medium,large
+
+    # Fully parallel (one variant per GPU, run concurrently):
+    python src/train.py --variants tiny,small,medium,large --parallel-variants
 """
 
 from __future__ import annotations
 
 import argparse
+import multiprocessing as py_mp
 import os
 import random
 import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -25,7 +33,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
@@ -44,8 +52,8 @@ from utils import (
     visualize_model_predictions,
 )
 
-# SwanLab is imported lazily so the script still runs in environments where it
-# isn't installed yet (the user just gets a clear message).
+# SwanLab is imported lazily so the script still runs in environments where
+# it isn't installed yet (the user just gets a clear message).
 try:
     import swanlab  # type: ignore
 except ImportError:  # pragma: no cover - exercised only without swanlab
@@ -56,14 +64,15 @@ except ImportError:  # pragma: no cover - exercised only without swanlab
 # Helpers
 # ---------------------------------------------------------------------------
 
-def set_seed(seed: int) -> None:
-    """Set random seed for reproducibility."""
+def set_seed(seed: int, deterministic: bool = False) -> None:
+    """Set random seeds. ``deterministic=True`` disables cudnn benchmarking
+    (slower but bit-exact reproducible)."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
 
 
 def _human_readable_size(num_bytes: int) -> str:
@@ -82,13 +91,13 @@ def _swanlab_enabled(args) -> bool:
     return swanlab is not None and args.swanlab_mode != 'disabled'
 
 
-def _swanlab_init(args, model, num_classes):
+def _swanlab_init(args, model, num_classes, variant):
     """Initialise a SwanLab run; safe to call only on the main process."""
     if not _swanlab_enabled(args):
         return None
 
     run_config = {
-        'variant': args.variant,
+        'variant': variant,
         'epochs': config.EPOCHS,
         'batch_size': config.BATCH_SIZE,
         'learning_rate': config.LEARNING_RATE,
@@ -99,12 +108,14 @@ def _swanlab_init(args, model, num_classes):
         'num_classes': num_classes,
         'trainable_parameters': count_parameters(model),
         'world_size': args.world_size,
+        'patience': args.patience,
+        'parallel_variants': args.parallel_variants,
     }
 
     init_kwargs = dict(
         project=args.swanlab_project,
-        experiment_name=args.swanlab_experiment or f'{args.variant}-{int(time.time())}',
-        description=f'CRNN captcha training ({args.variant} variant)',
+        experiment_name=args.swanlab_experiment or f'{variant}-{int(time.time())}',
+        description=f'CRNN captcha training ({variant} variant)',
         config=run_config,
         mode=args.swanlab_mode,
     )
@@ -114,12 +125,33 @@ def _swanlab_init(args, model, num_classes):
     return swanlab.init(**init_kwargs)
 
 
+def _apply_perf_knobs(args) -> None:
+    """Enable optional performance optimisations that are safe across GPUs."""
+    if args.tf32:
+        # Allow TF32 on Ampere+ GPUs; ignored on older hardware.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision('high')
+        except AttributeError:
+            pass
+
+
+def _make_optimizer(model, lr):
+    """Adam with fused kernels when supported (CUDA only, PyTorch 2.0+)."""
+    try:
+        return optim.Adam(model.parameters(), lr=lr, fused=True)
+    except (TypeError, RuntimeError):
+        return optim.Adam(model.parameters(), lr=lr)
+
+
 # ---------------------------------------------------------------------------
 # Train / validate
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
-                char_to_idx, epoch, logger, swanlab_run, log_global_step):
+                char_to_idx, idx_to_char, epoch, logger, swanlab_run, log_global_step,
+                use_amp):
     model.train()
     running_loss = 0.0
     correct = 0
@@ -131,25 +163,41 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
         encoded_labels, label_lengths = encode_labels(labels, char_to_idx)
         encoded_labels = encoded_labels.to(device, non_blocking=True)
 
-        with autocast():
+        if use_amp:
+            with autocast('cuda'):
+                outputs = model(images)
+        else:
             outputs = model(images)
-            log_probs = torch.nn.functional.log_softmax(outputs, dim=2)
-            input_lengths = torch.full(
-                size=(images.size(0),),
-                fill_value=outputs.size(0),
-                dtype=torch.long,
-                device=device,
-            )
-            loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
 
-        optimizer.zero_grad()
+        # CTC loss must run in FP32 to avoid numerical overflow / nan.
+        log_probs = torch.nn.functional.log_softmax(outputs.float(), dim=2)
+        input_lengths = torch.full(
+            size=(images.size(0),),
+            fill_value=outputs.size(0),
+            dtype=torch.long,
+            device=device,
+        )
+        loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
+
+        # Defensive guard: if loss is non-finite (e.g. due to a degenerate
+        # batch), skip this step entirely so a single bad batch can't poison
+        # the model weights with NaN forever.
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            if batch_idx % 50 == 0:
+                logger.warning(f'Skipping batch {batch_idx}: non-finite loss ({loss.item()})')
+            continue
+
+        optimizer.zero_grad(set_to_none=True)
         scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         scaler.step(optimizer)
         scaler.update()
 
         running_loss += loss.item()
 
-        preds = decode_predictions(outputs, {v: k for k, v in char_to_idx.items()})
+        preds = decode_predictions(outputs, idx_to_char)
         for p, t in zip(preds, labels):
             correct += int(p == t)
             total += 1
@@ -173,7 +221,7 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
     return train_loss, train_acc, len(train_loader)
 
 
-def validate_epoch(model, val_loader, criterion, device, char_to_idx, epoch, logger):
+def validate_epoch(model, val_loader, criterion, device, char_to_idx, idx_to_char, epoch, logger):
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -189,7 +237,7 @@ def validate_epoch(model, val_loader, criterion, device, char_to_idx, epoch, log
             encoded_labels = encoded_labels.to(device, non_blocking=True)
 
             outputs = model(images)
-            log_probs = torch.nn.functional.log_softmax(outputs, dim=2)
+            log_probs = torch.nn.functional.log_softmax(outputs.float(), dim=2)
             input_lengths = torch.full(
                 size=(images.size(0),),
                 fill_value=outputs.size(0),
@@ -199,7 +247,7 @@ def validate_epoch(model, val_loader, criterion, device, char_to_idx, epoch, log
             loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
             running_loss += loss.item()
 
-            preds = decode_predictions(outputs, {v: k for k, v in char_to_idx.items()})
+            preds = decode_predictions(outputs, idx_to_char)
             all_preds.extend(preds)
             all_labels.extend(labels)
             for p, t in zip(preds, labels):
@@ -216,13 +264,14 @@ def validate_epoch(model, val_loader, criterion, device, char_to_idx, epoch, log
 
 
 # ---------------------------------------------------------------------------
-# Main worker
+# Main worker (one variant, one rank)
 # ---------------------------------------------------------------------------
 
-def main_worker(gpu, ngpus_per_node, args):
-    rank = args.node_rank * ngpus_per_node + (gpu if gpu is not None else 0)
-    world_size = args.world_size
+def _train_one_variant(rank, world_size, gpu, variant, args):
+    """Run the full training loop for ONE variant in the current process.
 
+    ``world_size > 1`` means we are a DDP rank for that variant.
+    """
     if world_size > 1:
         dist.init_process_group(
             backend='nccl',
@@ -237,35 +286,52 @@ def main_worker(gpu, ngpus_per_node, args):
         torch.cuda.set_device(gpu)
         device = torch.device(f'cuda:{gpu}')
 
-    # Logger
+    _apply_perf_knobs(args)
+
     os.makedirs('logs', exist_ok=True)
-    if rank == 0:
-        logger = setup_logger('train', 'logs/train.log')
-    else:
-        logger = setup_logger(f'train_rank{rank}', f'logs/train_rank{rank}.log')
+    log_name = f'train-{variant}' if rank == 0 else f'train-{variant}-rank{rank}'
+    log_file = f'logs/{log_name}.log'
+    logger = setup_logger(log_name, log_file)
 
     # Model
     num_classes = config.NUM_CHARS + 1  # + CTC blank
-    model = build_model(args.variant, num_classes=num_classes,
-                        pretrained=getattr(args, 'pretrained', True)).to(device)
+    model = build_model(
+        variant,
+        num_classes=num_classes,
+        pretrained=getattr(args, 'pretrained', True),
+    ).to(device)
+
     if rank == 0:
         logger.info(
-            f'Building "{args.variant}" model with '
-            f'{count_parameters(model):,} trainable parameters'
+            f'[{variant}] {count_parameters(model):,} trainable parameters '
+            f'(world_size={world_size}, gpu={gpu})'
         )
 
-    scaler = GradScaler(enabled=device.type == 'cuda')
+    use_amp = device.type == 'cuda'
+    scaler = GradScaler('cuda', enabled=use_amp)
 
     if world_size > 1:
-        model = DDP(model, device_ids=[gpu] if gpu is not None else None)
+        if args.sync_bn:
+            model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        ddp_kwargs = dict(
+            device_ids=[gpu] if gpu is not None else None,
+            find_unused_parameters=False,
+            gradient_as_bucket_view=True,
+        )
+        model = DDP(model, **ddp_kwargs)
+        if args.static_graph:
+            try:
+                model._set_static_graph()
+            except Exception:  # noqa: BLE001
+                pass
 
-    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+    optimizer = _make_optimizer(model, config.LEARNING_RATE)
     scheduler = optim.lr_scheduler.StepLR(
         optimizer,
         step_size=config.LR_SCHEDULER_STEP,
         gamma=config.LR_SCHEDULER_GAMMA,
     )
-    criterion = nn.CTCLoss(blank=config.NUM_CHARS, reduction='mean')
+    criterion = nn.CTCLoss(blank=config.NUM_CHARS, reduction='mean', zero_infinity=True)
 
     char_to_idx = {ch: i for i, ch in enumerate(config.CHARS)}
     idx_to_char = {i: ch for i, ch in enumerate(config.CHARS)}
@@ -274,17 +340,18 @@ def main_worker(gpu, ngpus_per_node, args):
     train_loader, val_loader, train_sampler, val_sampler = get_data_loaders(
         config.DATA_DIR,
         config.BATCH_SIZE,
-        num_workers=4,
+        num_workers=args.num_workers,
         world_size=world_size if world_size > 1 else None,
         rank=rank if world_size > 1 else None,
+        prefetch_factor=args.prefetch_factor,
     )
 
     # Per-variant checkpoint dir
-    ckpt_dir = config.variant_checkpoint_dir(args.variant)
+    ckpt_dir = config.variant_checkpoint_dir(variant)
     if rank == 0:
         os.makedirs(ckpt_dir, exist_ok=True)
 
-    # SwanLab on main process only
+    # SwanLab on rank-0 only
     swanlab_run = None
     if rank == 0:
         if swanlab is None and args.swanlab_mode != 'disabled':
@@ -292,7 +359,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'swanlab is not installed. Run `pip install swanlab` to enable '
                 'experiment tracking, or pass --swanlab-mode disabled to silence.'
             )
-        swanlab_run = _swanlab_init(args, model, num_classes)
+        swanlab_run = _swanlab_init(args, model, num_classes, variant)
         if swanlab_run is not None:
             logger.info(f'SwanLab tracking enabled (mode={args.swanlab_mode}).')
         else:
@@ -314,8 +381,11 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             logger.warning(f'No checkpoint found at {args.resume}')
 
-    # Training loop
+    # Training loop with optional early stopping.
     global_step = 0
+    epochs_without_improvement = 0
+    stop_signal = torch.zeros(1, device=device)
+
     for epoch in range(start_epoch, config.EPOCHS):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -324,10 +394,11 @@ def main_worker(gpu, ngpus_per_node, args):
 
         train_loss, train_acc, num_train_batches = train_epoch(
             model, train_loader, optimizer, criterion, scaler,
-            device, char_to_idx, epoch, logger, swanlab_run, global_step,
+            device, char_to_idx, idx_to_char, epoch, logger,
+            swanlab_run, global_step, use_amp,
         )
         val_loss, val_acc, _, _ = validate_epoch(
-            model, val_loader, criterion, device, char_to_idx, epoch, logger,
+            model, val_loader, criterion, device, char_to_idx, idx_to_char, epoch, logger,
         )
 
         scheduler.step()
@@ -346,15 +417,11 @@ def main_worker(gpu, ngpus_per_node, args):
                     },
                     step=global_step,
                 )
-
-                # Periodic prediction visualisation.
                 if epoch % 5 == 0 or epoch == config.EPOCHS - 1:
                     try:
                         sample_img = visualize_model_predictions(
                             model.module if hasattr(model, 'module') else model,
-                            val_loader,
-                            idx_to_char,
-                            device,
+                            val_loader, idx_to_char, device,
                         )
                         swanlab_run.log(
                             {'val/predictions': swanlab.Image(sample_img, caption=f'epoch {epoch + 1}')},
@@ -364,10 +431,20 @@ def main_worker(gpu, ngpus_per_node, args):
                         logger.warning(f'Failed to log prediction image: {exc}')
 
             is_best = val_acc > best_val_acc
-            best_val_acc = max(val_acc, best_val_acc)
+            if is_best:
+                best_val_acc = val_acc
+                epochs_without_improvement = 0
+                logger.info(f'New best model with validation accuracy: {val_acc:.4f}')
+            else:
+                epochs_without_improvement += 1
+                logger.info(
+                    f'No val_acc improvement for {epochs_without_improvement} epoch(s) '
+                    f'(best={best_val_acc:.4f})'
+                )
+
             state = {
                 'epoch': epoch + 1,
-                'variant': args.variant,
+                'variant': variant,
                 'model_state_dict': (
                     model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
                 ),
@@ -380,24 +457,33 @@ def main_worker(gpu, ngpus_per_node, args):
                 'best_val_acc': best_val_acc,
             }
             save_checkpoint(state, is_best, ckpt_dir)
-            if is_best:
-                logger.info(f'New best model with validation accuracy: {val_acc:.4f}')
+
+            # Early stopping decision (rank-0 only). Broadcast to all ranks.
+            if args.patience > 0 and epochs_without_improvement >= args.patience:
+                logger.info(
+                    f'Early stopping triggered: {epochs_without_improvement} epochs '
+                    f'without improvement (patience={args.patience}).'
+                )
+                stop_signal.fill_(1)
 
         global_step += num_train_batches
 
-    # Finalise
-    if rank == 0:
-        logger.info('Training completed!')
+        # Synchronise the early-stop signal across all DDP ranks.
+        if world_size > 1:
+            dist.broadcast(stop_signal, src=0)
+        if stop_signal.item() > 0:
+            break
 
-        # Save the final pure-weights pth (for inference / deployment).
-        final_path = config.final_model_path(args.variant)
+    # Finalise (rank 0 only)
+    if rank == 0:
+        logger.info(f'[{variant}] Training completed. Best val acc: {best_val_acc:.4f}')
+        final_path = config.final_model_path(variant)
         os.makedirs(os.path.dirname(final_path), exist_ok=True)
         torch.save(
             model.module.state_dict() if hasattr(model, 'module') else model.state_dict(),
             final_path,
         )
-        logger.info(f'Final model saved to {final_path} ({_file_size(final_path)})')
-
+        logger.info(f'[{variant}] Final model saved to {final_path} ({_file_size(final_path)})')
         if swanlab_run is not None:
             swanlab_run.log({'final/best_val_accuracy': best_val_acc})
             swanlab_run.finish()
@@ -407,23 +493,144 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
 # ---------------------------------------------------------------------------
+# Launchers
+# ---------------------------------------------------------------------------
+
+def _ddp_launch_one_variant(variant: str, args, ngpus_per_node: int) -> None:
+    """Train a single variant using DDP across all available GPUs."""
+    args.world_size = max(args.nodes * ngpus_per_node, 1)
+
+    if ngpus_per_node <= 1 or args.world_size == 1:
+        gpu = 0 if ngpus_per_node >= 1 else None
+        _train_one_variant(rank=0, world_size=1, gpu=gpu, variant=variant, args=args)
+        return
+
+    def _worker(gpu, ngpus, args_, variant_):
+        rank = args_.node_rank * ngpus + gpu
+        _train_one_variant(rank, args_.world_size, gpu, variant_, args_)
+
+    mp.spawn(_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args, variant))
+
+
+def _parallel_pool_worker(gpu_id, variants_to_run, args):
+    """One process per GPU; trains every variant in its slice sequentially.
+
+    This is simpler than a queue-based pool but achieves the same effect since
+    we pre-shard the variants list across GPUs in round-robin order.
+    """
+    # Each subprocess gets its own world: single GPU, no DDP.
+    args.world_size = 1
+    for variant in variants_to_run:
+        # Each variant gets its own SwanLab run (init/finish inside).
+        _train_one_variant(rank=0, world_size=1, gpu=gpu_id, variant=variant, args=args)
+
+
+def _parallel_launch_variants(variants, args, ngpus_per_node: int) -> None:
+    """Spawn one process per GPU; each process handles its share of variants."""
+    if ngpus_per_node <= 1:
+        # Falls back to sequential single-GPU.
+        for v in variants:
+            _ddp_launch_one_variant(v, args, ngpus_per_node)
+        return
+
+    # Round-robin: variant i goes to GPU (i % ngpus_per_node).
+    shards = [[] for _ in range(ngpus_per_node)]
+    for i, v in enumerate(variants):
+        shards[i % ngpus_per_node].append(v)
+
+    ctx = py_mp.get_context('spawn')
+    procs = []
+    for gpu_id, shard in enumerate(shards):
+        if not shard:
+            continue
+        p = ctx.Process(target=_parallel_pool_worker, args=(gpu_id, shard, args))
+        p.start()
+        procs.append(p)
+
+    exit_code = 0
+    for p in procs:
+        p.join()
+        if p.exitcode != 0:
+            exit_code = p.exitcode
+    if exit_code != 0:
+        sys.exit(exit_code)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _parse_variants(args) -> list[str]:
+    if args.variants:
+        out = []
+        for v in args.variants.split(','):
+            v = v.strip().lower()
+            if not v:
+                continue
+            if v == 'all':
+                out.extend(VARIANTS)
+            elif v in VARIANTS:
+                out.append(v)
+            else:
+                raise SystemExit(f'Unknown variant: {v!r}. Expected one of {VARIANTS} (or "all").')
+        # Dedup while preserving order.
+        seen = set()
+        out = [v for v in out if not (v in seen or seen.add(v))]
+        if out:
+            return out
+    return [args.variant]
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train a captcha recognition model with SwanLab tracking')
+
+    # Variant selection
     parser.add_argument('--variant', default=config.DEFAULT_VARIANT, choices=VARIANTS,
-                        help='Model size variant (tiny ~1MB, small ~3MB, medium ~10MB, large unlimited)')
+                        help='Single model size variant. Ignored if --variants is given.')
+    parser.add_argument('--variants', default='',
+                        help='Comma-separated list of variants to train, or "all". '
+                             'Overrides --variant when provided. '
+                             'Example: --variants tiny,small,medium,large')
+    parser.add_argument('--parallel-variants', action='store_true',
+                        help='Train multiple variants concurrently, one per GPU. '
+                             'Each variant uses a single GPU (no DDP). '
+                             'Default is sequential, where each variant in turn '
+                             'uses every available GPU via DDP.')
+
+    # Distributed
     parser.add_argument('--nodes', default=1, type=int, help='Number of distributed nodes')
     parser.add_argument('--node-rank', default=0, type=int, help='Rank of this node')
     parser.add_argument('--dist-url', default='tcp://localhost:23456', type=str,
                         help='URL used to initialise the distributed process group')
+
+    # Misc
     parser.add_argument('--seed', default=42, type=int, help='Random seed')
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume from')
-
     parser.add_argument('--no-pretrained', dest='pretrained', action='store_false',
                         help='Skip downloading ImageNet-pretrained ResNet-18 weights (large variant only).')
     parser.set_defaults(pretrained=True)
+
+    # Early stopping
+    parser.add_argument('--patience', type=int, default=8,
+                        help='Stop training if val_acc has not improved for this many epochs. '
+                             'Set 0 to disable early stopping.')
+
+    # Performance / DDP knobs
+    parser.add_argument('--num-workers', type=int, default=4,
+                        help='DataLoader num_workers per process')
+    parser.add_argument('--prefetch-factor', type=int, default=4,
+                        help='DataLoader prefetch_factor per worker')
+    parser.add_argument('--no-tf32', dest='tf32', action='store_false',
+                        help='Disable TF32 matmul on Ampere+ GPUs (TF32 is on by default).')
+    parser.set_defaults(tf32=True)
+    parser.add_argument('--deterministic', action='store_true',
+                        help='Force cudnn.deterministic=True (slower, bit-exact).')
+    parser.add_argument('--no-static-graph', dest='static_graph', action='store_false',
+                        help='Disable DDP static_graph optimisation.')
+    parser.set_defaults(static_graph=True)
+    parser.add_argument('--sync-bn', action='store_true',
+                        help='Convert BatchNorm to SyncBatchNorm in DDP (slightly slower; '
+                             'helps when per-card batch is small).')
 
     # SwanLab options
     parser.add_argument('--swanlab-project', default=config.SWANLAB_PROJECT,
@@ -438,17 +645,32 @@ def main():
 
     args = parser.parse_args()
 
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=args.deterministic)
     os.makedirs('logs', exist_ok=True)
 
+    variants = _parse_variants(args)
     ngpus_per_node = torch.cuda.device_count()
     args.world_size = max(args.nodes * ngpus_per_node, 1)
 
-    if ngpus_per_node <= 1 or args.world_size == 1:
-        gpu = 0 if ngpus_per_node >= 1 else None
-        main_worker(gpu, max(ngpus_per_node, 1), args)
+    print(
+        f'Variants to train: {variants}'
+        f' | parallel={args.parallel_variants}'
+        f' | gpus={ngpus_per_node}'
+        f' | patience={args.patience}'
+    )
+
+    if len(variants) > 1 and args.parallel_variants and ngpus_per_node > 1:
+        # One process per GPU; each handles a shard of variants.
+        _parallel_launch_variants(variants, args, ngpus_per_node)
     else:
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+        # Sequential: each variant in turn uses every GPU via DDP (or single GPU).
+        if args.parallel_variants and len(variants) > 1:
+            print(
+                'Note: --parallel-variants requested but only one GPU is available. '
+                'Falling back to sequential training.'
+            )
+        for variant in variants:
+            _ddp_launch_one_variant(variant, args, ngpus_per_node)
 
 
 if __name__ == '__main__':

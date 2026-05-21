@@ -43,24 +43,41 @@ def encode_labels(labels, char_to_idx):
     return torch.IntTensor(encoded), torch.IntTensor(lengths)
 
 def decode_predictions(preds, idx_to_char):
-    """Decode model predictions to text using CTC decoding"""
+    """Decode model predictions to text using CTC decoding.
+
+    Parameters
+    ----------
+    preds : Tensor of shape (seq_len, batch, num_classes)
+    idx_to_char : dict mapping int index -> str character.
+        The blank token must be mapped to '' (empty string).
+    """
     _, max_indices = torch.max(preds, dim=2)  # Get character indices
     decoded_preds = []
-    
+
+    # Determine the blank index: we treat any index whose mapped char is ''
+    # (empty string) as blank. Fallback: highest index in the dict.
+    blank_index = max(idx_to_char.keys())
+    for k, v in idx_to_char.items():
+        if v == '':
+            blank_index = k
+            break
+
     for i in range(max_indices.shape[1]):  # iterate over samples in batch
         raw_prediction = max_indices[:, i]
         prediction = []
-        
+
         # CTC decoding: collapse repeated characters and remove blanks
         previous = None
         for j in range(raw_prediction.shape[0]):
             char_index = raw_prediction[j].item()
-            if char_index != len(idx_to_char) - 1 and (previous is None or char_index != previous):
-                prediction.append(idx_to_char[char_index])
+            if char_index != blank_index and (previous is None or char_index != previous):
+                char = idx_to_char.get(char_index, '')
+                if char:
+                    prediction.append(char)
             previous = char_index
-        
+
         decoded_preds.append("".join(prediction))
-    
+
     return decoded_preds
 
 def save_checkpoint(state, is_best, checkpoint_dir):
