@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
 import torch.optim as optim
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
@@ -119,7 +119,7 @@ def _swanlab_init(args, model, num_classes):
 # ---------------------------------------------------------------------------
 
 def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
-                char_to_idx, epoch, logger, swanlab_run, log_global_step):
+                char_to_idx, idx_to_char, epoch, logger, swanlab_run, log_global_step):
     model.train()
     running_loss = 0.0
     correct = 0
@@ -131,7 +131,7 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
         encoded_labels, label_lengths = encode_labels(labels, char_to_idx)
         encoded_labels = encoded_labels.to(device, non_blocking=True)
 
-        with autocast():
+        with autocast('cuda'):
             outputs = model(images)
             log_probs = torch.nn.functional.log_softmax(outputs, dim=2)
             input_lengths = torch.full(
@@ -149,7 +149,7 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
 
         running_loss += loss.item()
 
-        preds = decode_predictions(outputs, {v: k for k, v in char_to_idx.items()})
+        preds = decode_predictions(outputs, idx_to_char)
         for p, t in zip(preds, labels):
             correct += int(p == t)
             total += 1
@@ -173,7 +173,7 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
     return train_loss, train_acc, len(train_loader)
 
 
-def validate_epoch(model, val_loader, criterion, device, char_to_idx, epoch, logger):
+def validate_epoch(model, val_loader, criterion, device, char_to_idx, idx_to_char, epoch, logger):
     model.eval()
     running_loss = 0.0
     correct = 0
@@ -199,7 +199,7 @@ def validate_epoch(model, val_loader, criterion, device, char_to_idx, epoch, log
             loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
             running_loss += loss.item()
 
-            preds = decode_predictions(outputs, {v: k for k, v in char_to_idx.items()})
+            preds = decode_predictions(outputs, idx_to_char)
             all_preds.extend(preds)
             all_labels.extend(labels)
             for p, t in zip(preds, labels):
@@ -254,7 +254,7 @@ def main_worker(gpu, ngpus_per_node, args):
             f'{count_parameters(model):,} trainable parameters'
         )
 
-    scaler = GradScaler(enabled=device.type == 'cuda')
+    scaler = GradScaler('cuda', enabled=device.type == 'cuda')
 
     if world_size > 1:
         model = DDP(model, device_ids=[gpu] if gpu is not None else None)
@@ -324,10 +324,10 @@ def main_worker(gpu, ngpus_per_node, args):
 
         train_loss, train_acc, num_train_batches = train_epoch(
             model, train_loader, optimizer, criterion, scaler,
-            device, char_to_idx, epoch, logger, swanlab_run, global_step,
+            device, char_to_idx, idx_to_char, epoch, logger, swanlab_run, global_step,
         )
         val_loss, val_acc, _, _ = validate_epoch(
-            model, val_loader, criterion, device, char_to_idx, epoch, logger,
+            model, val_loader, criterion, device, char_to_idx, idx_to_char, epoch, logger,
         )
 
         scheduler.step()
