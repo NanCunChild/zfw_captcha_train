@@ -50,52 +50,61 @@ class CaptchaDataset(Dataset):
         
         return image, label
 
-def get_data_loaders(data_dir, batch_size, num_workers=4, world_size=None, rank=None):
+def get_data_loaders(data_dir, batch_size, num_workers=4, world_size=None,
+                     rank=None, prefetch_factor=4):
     # Define transforms
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-    
+
     # Create datasets
     train_dataset = CaptchaDataset(data_dir, transform=transform, split='train')
     val_dataset = CaptchaDataset(data_dir, transform=transform, split='val')
-    
+
     # Create samplers for distributed training if needed
     train_sampler = None
     val_sampler = None
-    
+
     if world_size is not None and rank is not None:
         train_sampler = DistributedSampler(
-            train_dataset, 
-            num_replicas=world_size, 
+            train_dataset,
+            num_replicas=world_size,
             rank=rank,
             shuffle=True
         )
         val_sampler = DistributedSampler(
-            val_dataset, 
-            num_replicas=world_size, 
+            val_dataset,
+            num_replicas=world_size,
             rank=rank,
             shuffle=False
         )
-    
-    # Create data loaders
+
+    # `persistent_workers` keeps data-loader workers alive across epochs so we
+    # don't pay their startup cost every time. `prefetch_factor` lets each
+    # worker prefetch a few batches ahead, which keeps the GPU fed.
+    loader_kwargs = dict(
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = True
+        loader_kwargs['prefetch_factor'] = prefetch_factor
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=(train_sampler is None),
-        num_workers=num_workers,
         sampler=train_sampler,
-        pin_memory=True
+        **loader_kwargs,
     )
-    
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
         sampler=val_sampler,
-        pin_memory=True
+        **loader_kwargs,
     )
-    
+
     return train_loader, val_loader, train_sampler, val_sampler
