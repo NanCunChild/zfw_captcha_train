@@ -144,6 +144,15 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
         )
         loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
 
+        # Defensive guard: if loss is non-finite (e.g. due to a degenerate
+        # batch), skip this step entirely so a single bad batch can't
+        # poison the model weights with NaN forever.
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            if batch_idx % 50 == 0:
+                logger.warning(f'Skipping batch {batch_idx}: non-finite loss ({loss.item()})')
+            continue
+
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         # Gradient clipping to prevent exploding gradients with CTC.
@@ -270,7 +279,7 @@ def main_worker(gpu, ngpus_per_node, args):
         step_size=config.LR_SCHEDULER_STEP,
         gamma=config.LR_SCHEDULER_GAMMA,
     )
-    criterion = nn.CTCLoss(blank=config.NUM_CHARS, reduction='mean')
+    criterion = nn.CTCLoss(blank=config.NUM_CHARS, reduction='mean', zero_infinity=True)
 
     char_to_idx = {ch: i for i, ch in enumerate(config.CHARS)}
     idx_to_char = {i: ch for i, ch in enumerate(config.CHARS)}
