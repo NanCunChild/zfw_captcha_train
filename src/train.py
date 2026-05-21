@@ -133,17 +133,22 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
 
         with autocast('cuda'):
             outputs = model(images)
-            log_probs = torch.nn.functional.log_softmax(outputs, dim=2)
-            input_lengths = torch.full(
-                size=(images.size(0),),
-                fill_value=outputs.size(0),
-                dtype=torch.long,
-                device=device,
-            )
-            loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
+
+        # CTC loss must run in FP32 to avoid numerical overflow / nan.
+        log_probs = torch.nn.functional.log_softmax(outputs.float(), dim=2)
+        input_lengths = torch.full(
+            size=(images.size(0),),
+            fill_value=outputs.size(0),
+            dtype=torch.long,
+            device=device,
+        )
+        loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
 
         optimizer.zero_grad()
         scaler.scale(loss).backward()
+        # Gradient clipping to prevent exploding gradients with CTC.
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
         scaler.step(optimizer)
         scaler.update()
 
