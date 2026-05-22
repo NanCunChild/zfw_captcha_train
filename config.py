@@ -10,14 +10,15 @@ DATA_DIR = 'data/captcha_get'
 IMG_WIDTH = 90
 IMG_HEIGHT = 34
 
-# Character set (CTC blank is appended automatically by the trainer)
+# Character set. The captcha is fixed-length, exactly 4 digits.
 CHARS = '0123456789'
 NUM_CHARS = len(CHARS)
+CAPTCHA_LENGTH = 4
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
-BATCH_SIZE = 128
+BATCH_SIZE = 512
 EPOCHS = 50
 LEARNING_RATE = 0.001
 LR_SCHEDULER_STEP = 10
@@ -26,13 +27,15 @@ LR_SCHEDULER_GAMMA = 0.5
 # ---------------------------------------------------------------------------
 # Model variants
 # ---------------------------------------------------------------------------
-# Available variants (defined in src/model.py):
-#   "tiny"   ~  1 MB   light custom CNN + small Bi-LSTM
-#   "small"  ~  3 MB   wider custom CNN + Bi-LSTM
-#   "medium" ~ 10 MB   deeper custom CNN + 2-layer Bi-LSTM
-#   "large"  unlimited ResNet-18 backbone + 2-layer Bi-LSTM (original)
+# Available variants (defined in src/model.py). All are pure CNN with 4
+# independent classification heads (one per digit position).
+#   "nano"   ~  85 KB   absolute minimum (< 100 KB)
+#   "tiny"   ~ 385 KB   default lightweight
+#   "small"  ~ 785 KB
+#   "medium" ~ 2.6 MB
+#   "large"  ~ 5.4 MB
 DEFAULT_VARIANT = 'tiny'
-VARIANTS = ('tiny', 'small', 'medium', 'large')
+VARIANTS = ('nano', 'tiny', 'small', 'medium', 'large')
 
 # ---------------------------------------------------------------------------
 # SwanLab monitoring

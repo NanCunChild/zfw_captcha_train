@@ -1,56 +1,64 @@
 # model.py
-"""CRNN models for captcha recognition.
+"""Compact pure-CNN models for fixed-length 4-digit captcha recognition.
 
-Four variants are exposed through :func:`build_model`:
+The captcha task is constrained: exactly 4 digits, no character distortion,
+only rotation + noise + line interference. An RNN is overkill, so this module
+exposes a family of small CNN-only models that emit ``(B, 4, 10)`` logits --
+one classification head per digit position. Training uses the sum of 4
+``CrossEntropyLoss`` terms (no CTC).
 
-* ``tiny``   ~ 1 MB  (light custom CNN + small Bi-LSTM)
-* ``small``  ~ 3 MB  (slightly wider custom CNN + Bi-LSTM)
-* ``medium`` ~ 10 MB (deeper custom CNN + 2-layer Bi-LSTM)
-* ``large``  unlimited (ResNet-18 backbone + 2-layer Bi-LSTM, original model)
+Variants:
 
-All variants output ``(sequence_length, batch, num_classes)`` log-its where
-``num_classes`` already includes the CTC blank token.
+* ``nano``   ~ 21K params  (~85 KB on disk, hard < 100 KB)
+* ``tiny``   ~ 96K params  (~385 KB,  < 500 KB)
+* ``small``  ~ 196K params (~785 KB)
+* ``large``  ~ 1.36M params (~5.4 MB)
 """
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import torch
 import torch.nn as nn
-from torchvision import models
-from torchvision.models import ResNet18_Weights
 
 
-# ---------------------------------------------------------------------------
-# Lightweight CRNN (used for tiny / small / medium variants)
-# ---------------------------------------------------------------------------
-
-# Each entry roughly targets a saved-state-dict size in float32:
-#   tiny   ~  1 MB
-#   small  ~  3 MB
-#   medium ~ 10 MB
-LIGHT_MODEL_CONFIGS = {
+# Each entry defines a stack of 3x3 conv blocks (Conv -> BN -> ReLU). The
+# matching ``pools`` list says whether to apply a 2x2 max-pool after that
+# block. With a 34x90 input we need exactly 3 pools to land on a ~4x11
+# spatial map, which the final adaptive average pool collapses to (1, 4) --
+# one feature column per digit.
+MODEL_CONFIGS: dict[str, dict[str, Sequence]] = {
+    "nano": {
+        "channels": [10, 20, 32, 40],
+        "pools":    [True, True, True, False],
+    },
     "tiny": {
-        "channels": [16, 32, 64, 128],
-        "lstm_hidden": 96,
-        "lstm_layers": 1,
-        "lstm_dropout": 0.0,
+        "channels": [16, 32, 48, 64, 80],
+        "pools":    [True, True, True, False, False],
     },
     "small": {
-        "channels": [32, 64, 128, 256],
-        "lstm_hidden": 128,
-        "lstm_layers": 1,
-        "lstm_dropout": 0.0,
+        "channels": [24, 48, 64, 96, 112],
+        "pools":    [True, True, True, False, False],
     },
     "medium": {
-        "channels": [32, 64, 128, 256, 256],
-        "lstm_hidden": 192,
-        "lstm_layers": 2,
-        "lstm_dropout": 0.2,
+        "channels": [32, 64, 96, 128, 160, 192],
+        "pools":    [True, True, True, False, False, False],
+    },
+    "large": {
+        "channels": [32, 64, 128, 192, 256, 256],
+        "pools":    [True, True, True, False, False, False],
     },
 }
 
+NUM_POSITIONS = 4   # the captcha always has 4 digits
+NUM_DIGITS = 10     # 0-9
+
+VARIANTS = tuple(MODEL_CONFIGS.keys())
+
 
 def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
+    """3x3 Conv -> BN -> ReLU. Bias is dropped because BN absorbs it."""
     return nn.Sequential(
         nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
         nn.BatchNorm2d(out_ch),
@@ -58,164 +66,88 @@ def _conv_block(in_ch: int, out_ch: int) -> nn.Sequential:
     )
 
 
-class LightCRNN(nn.Module):
-    """A compact CRNN whose capacity is chosen by ``variant``."""
+class CaptchaCNN(nn.Module):
+    """Pure CNN with 4 independent linear heads (one per digit slot)."""
 
-    def __init__(self, num_classes: int, variant: str = "tiny") -> None:
+    def __init__(
+        self,
+        variant: str = "tiny",
+        num_positions: int = NUM_POSITIONS,
+        num_digits: int = NUM_DIGITS,
+    ) -> None:
         super().__init__()
-        if variant not in LIGHT_MODEL_CONFIGS:
+        if variant not in MODEL_CONFIGS:
             raise ValueError(
-                f"Unknown light variant: {variant!r}. "
-                f"Expected one of {list(LIGHT_MODEL_CONFIGS)}."
+                f"Unknown variant {variant!r}. Expected one of {list(MODEL_CONFIGS)}."
             )
 
-        cfg = LIGHT_MODEL_CONFIGS[variant]
-        channels = cfg["channels"]
-        hidden = cfg["lstm_hidden"]
-        num_layers = cfg["lstm_layers"]
-        dropout = cfg["lstm_dropout"]
+        cfg = MODEL_CONFIGS[variant]
+        channels: Sequence[int] = cfg["channels"]
+        pools: Sequence[bool] = cfg["pools"]
+        if len(channels) != len(pools):
+            raise ValueError("`channels` and `pools` must be the same length")
 
         layers: list[nn.Module] = []
         in_ch = 3
-        n = len(channels)
-        for i, out_ch in enumerate(channels):
+        for out_ch, do_pool in zip(channels, pools):
             layers.append(_conv_block(in_ch, out_ch))
-            if i < n - 1:
-                # First two pools shrink both dims; later pools shrink only
-                # height so we keep enough width for the CTC sequence.
-                if i < 2:
-                    layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
-                else:
-                    layers.append(nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1)))
+            if do_pool:
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
             in_ch = out_ch
-
         self.cnn = nn.Sequential(*layers)
-        # Collapse any remaining height into the channel-time view.
-        self.collapse = nn.AdaptiveAvgPool2d((1, None))
 
-        self.rnn = nn.LSTM(
-            input_size=channels[-1],
-            hidden_size=hidden,
-            num_layers=num_layers,
-            bidirectional=True,
-            dropout=dropout if num_layers > 1 else 0.0,
-            batch_first=False,
+        feat_dim = channels[-1]
+        # Collapse height to 1 and force exactly ``num_positions`` columns,
+        # so each column corresponds to one digit slot in the captcha.
+        self.collapse = nn.AdaptiveAvgPool2d((1, num_positions))
+        self.heads = nn.ModuleList(
+            [nn.Linear(feat_dim, num_digits) for _ in range(num_positions)]
         )
-        self.fc = nn.Linear(hidden * 2, num_classes)
+        self.num_positions = num_positions
+        self.num_digits = num_digits
 
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
-        for m in self.cnn.modules():
+        for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-        for name, param in self.rnn.named_parameters():
-            if "weight" in name:
-                nn.init.orthogonal_(param)
-            elif "bias" in name:
-                nn.init.constant_(param, 0)
-        nn.init.xavier_uniform_(self.fc.weight)
-        nn.init.constant_(self.fc.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.cnn(x)                       # (B, C, H, W)
-        x = self.collapse(x)                  # (B, C, 1, W)
-        x = x.squeeze(2)                      # (B, C, W)
-        x = x.permute(2, 0, 1).contiguous()   # (W, B, C)
-        x, _ = self.rnn(x)                    # (W, B, 2*hidden)
-        x = self.fc(x)                        # (W, B, num_classes)
-        return x
-
-
-# ---------------------------------------------------------------------------
-# Original CRNN (ResNet-18 backbone) -- kept as the "large" / unlimited variant
-# ---------------------------------------------------------------------------
-
-
-class CRNN(nn.Module):
-    """ResNet-18 backbone + 2-layer Bi-LSTM. Original full-size model."""
-
-    def __init__(self, num_classes: int, pretrained: bool = True) -> None:
-        super().__init__()
-        weights = ResNet18_Weights.IMAGENET1K_V1 if pretrained else None
-        try:
-            resnet = models.resnet18(weights=weights)
-        except Exception:
-            # Network unreachable / SSL issue: fall back to random init so the
-            # script still works in offline or sandboxed environments.
-            resnet = models.resnet18(weights=None)
-        # Drop the final AvgPool + FC layers.
-        self.cnn = nn.Sequential(*list(resnet.children())[:-2])
-        self.collapse = nn.AdaptiveAvgPool2d((1, None))
-
-        self.rnn = nn.LSTM(
-            input_size=512,
-            hidden_size=256,
-            num_layers=2,
-            bidirectional=True,
-            dropout=0.2,
-            batch_first=False,
+        x = self.cnn(x)                         # (B, C, H', W')
+        x = self.collapse(x)                    # (B, C, 1, num_positions)
+        x = x.squeeze(2).permute(0, 2, 1)       # (B, num_positions, C)
+        # Apply one Linear head per position. Stacked output: (B, P, num_digits).
+        out = torch.stack(
+            [head(x[:, i, :]) for i, head in enumerate(self.heads)],
+            dim=1,
         )
-        self.fc = nn.Linear(512, num_classes)
-
-        self._initialize_weights()
-
-    def _initialize_weights(self) -> None:
-        for name, param in self.rnn.named_parameters():
-            if "weight" in name:
-                nn.init.orthogonal_(param)
-            elif "bias" in name:
-                nn.init.constant_(param, 0)
-        nn.init.xavier_uniform_(self.fc.weight)
-        nn.init.constant_(self.fc.bias, 0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.cnn(x)                                # (B, 512, H, W)
-        b, c, h, w = x.shape
-        # Flatten H*W into the time dimension so the sequence is long enough
-        # for CTC alignment (ResNet-18 reduces a 34x90 input to 2x3, which
-        # would otherwise leave only 3 time-steps).
-        x = x.permute(0, 2, 3, 1).reshape(b, h * w, c)  # (B, H*W, C)
-        x = x.permute(1, 0, 2).contiguous()             # (H*W, B, C)
-        x, _ = self.rnn(x)                              # (H*W, B, 2*hidden)
-        x = self.fc(x)                                  # (H*W, B, num_classes)
-        return x
+        return out
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+def build_model(variant: str, num_classes: int = NUM_DIGITS, **_: object) -> nn.Module:
+    """Build a :class:`CaptchaCNN` for the requested ``variant``.
 
-VARIANTS = ("tiny", "small", "medium", "large")
-
-
-def build_model(variant: str, num_classes: int, pretrained: bool = True) -> nn.Module:
-    """Build a CRNN for the requested size ``variant``.
-
-    Parameters
-    ----------
-    variant : str
-        One of ``tiny``, ``small``, ``medium``, ``large``.
-    num_classes : int
-        Number of output classes (must already include the CTC blank).
-    pretrained : bool
-        Only meaningful for ``large``; if ``True`` (default) try to download
-        ImageNet-pretrained ResNet-18 weights, falling back to random init when
-        the network is unreachable.
+    The legacy ``num_classes`` and ``pretrained`` kwargs are accepted for
+    backwards compatibility but ignored: this model fixes the per-position
+    output dimension to 10 (digits 0-9) and never loads pretrained weights.
     """
-    variant = variant.lower()
-    if variant == "large":
-        return CRNN(num_classes=num_classes, pretrained=pretrained)
-    if variant in LIGHT_MODEL_CONFIGS:
-        return LightCRNN(num_classes=num_classes, variant=variant)
-    raise ValueError(
-        f"Unknown model variant: {variant!r}. Expected one of {VARIANTS}."
-    )
+    if num_classes not in (NUM_DIGITS, NUM_DIGITS + 1):
+        # We tolerate the old "+1 for CTC blank" call sites, but anything
+        # else likely indicates a misconfiguration.
+        raise ValueError(
+            f"num_classes={num_classes} is not supported. "
+            f"This model emits exactly {NUM_DIGITS} classes per digit."
+        )
+    return CaptchaCNN(variant=variant.lower())
 
 
 def count_parameters(model: nn.Module) -> int:
-    """Return the number of trainable parameters in ``model``."""
+    """Number of trainable parameters in ``model``."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

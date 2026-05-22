@@ -25,8 +25,7 @@ from utils import decode_predictions
 def evaluate_model(variant: str, model_path: str, data_dir: str, batch_size: int) -> float:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    num_classes = config.NUM_CHARS + 1  # + CTC blank
-    model = build_model(variant, num_classes=num_classes)
+    model = build_model(variant)
 
     state_dict = torch.load(model_path, map_location=device)
     # Support both raw state_dicts and full checkpoint dicts.
@@ -38,7 +37,6 @@ def evaluate_model(variant: str, model_path: str, data_dir: str, batch_size: int
     _, val_loader, _, _ = get_data_loaders(data_dir, batch_size, num_workers=4)
 
     idx_to_char = {i: ch for i, ch in enumerate(config.CHARS)}
-    idx_to_char[config.NUM_CHARS] = ''  # blank
 
     correct = 0
     total = 0

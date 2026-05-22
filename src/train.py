@@ -1,21 +1,25 @@
 # train.py
-"""Train a captcha CRNN model and stream metrics to SwanLab.
+"""Train a captcha CNN model and stream metrics to SwanLab.
 
-Replaces the previous TensorBoard + local HTML monitor with the SwanLab
-experiment-tracking platform. Pick a model size with ``--variant``:
+The captcha is fixed-length (4 digits, 0-9), so the model is a pure CNN with
+4 classification heads and the loss is the sum of 4 ``CrossEntropyLoss``
+terms. No CTC, no RNN.
 
-    python src/train.py --variant tiny      # ~1MB  pth
-    python src/train.py --variant small     # ~3MB  pth
-    python src/train.py --variant medium    # ~10MB pth
-    python src/train.py --variant large     # full ResNet-18 backbone (no cap)
+Pick a model size with ``--variant``:
+
+    python src/train.py --variant nano      # < 100 KB
+    python src/train.py --variant tiny      # < 500 KB (default)
+    python src/train.py --variant small     # ~ 800 KB
+    python src/train.py --variant medium    # ~ 2.6 MB
+    python src/train.py --variant large     # ~ 5.4 MB
 
 You can also produce several artifacts in a single command:
 
     # Sequential (each variant uses every available GPU via DDP):
-    python src/train.py --variants tiny,small,medium,large
+    python src/train.py --variants nano,tiny,small,medium,large
 
     # Fully parallel (one variant per GPU, run concurrently):
-    python src/train.py --variants tiny,small,medium,large --parallel-variants
+    python src/train.py --variants all --parallel-variants
 """
 
 from __future__ import annotations
@@ -91,7 +95,7 @@ def _swanlab_enabled(args) -> bool:
     return swanlab is not None and args.swanlab_mode != 'disabled'
 
 
-def _swanlab_init(args, model, num_classes, variant):
+def _swanlab_init(args, model, variant):
     """Initialise a SwanLab run; safe to call only on the main process."""
     if not _swanlab_enabled(args):
         return None
@@ -105,7 +109,8 @@ def _swanlab_init(args, model, num_classes, variant):
         'lr_scheduler_gamma': config.LR_SCHEDULER_GAMMA,
         'image_width': config.IMG_WIDTH,
         'image_height': config.IMG_HEIGHT,
-        'num_classes': num_classes,
+        'captcha_length': config.CAPTCHA_LENGTH,
+        'num_classes': config.NUM_CHARS,
         'trainable_parameters': count_parameters(model),
         'world_size': args.world_size,
         'patience': args.patience,
@@ -115,7 +120,7 @@ def _swanlab_init(args, model, num_classes, variant):
     init_kwargs = dict(
         project=args.swanlab_project,
         experiment_name=args.swanlab_experiment or f'{variant}-{int(time.time())}',
-        description=f'CRNN captcha training ({variant} variant)',
+        description=f'CNN captcha training ({variant} variant)',
         config=run_config,
         mode=args.swanlab_mode,
     )
@@ -145,6 +150,26 @@ def _make_optimizer(model, lr):
         return optim.Adam(model.parameters(), lr=lr)
 
 
+def _multihead_loss(logits: torch.Tensor, targets: torch.Tensor,
+                    criterion: nn.Module) -> torch.Tensor:
+    """Sum CE loss across the captcha positions.
+
+    ``logits`` has shape (B, P, C) and ``targets`` has shape (B, P).
+    """
+    b, p, c = logits.shape
+    # Flattening once is faster than a Python loop and mathematically the
+    # same as summing the per-position losses then dividing by P. To keep
+    # the user-facing behaviour ("sum of 4 CrossEntropy"), we scale by P.
+    return criterion(logits.reshape(b * p, c), targets.reshape(b * p)) * p
+
+
+def _accuracy(logits: torch.Tensor, targets: torch.Tensor) -> tuple[int, int]:
+    """Return ``(num_fully_correct, batch_size)`` for a multi-head batch."""
+    preds = logits.argmax(dim=2)                     # (B, P)
+    correct = (preds == targets).all(dim=1).sum().item()
+    return int(correct), int(targets.size(0))
+
+
 # ---------------------------------------------------------------------------
 # Train / validate
 # ---------------------------------------------------------------------------
@@ -160,24 +185,17 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
     pbar = tqdm(train_loader, desc=f'Epoch {epoch + 1}/{config.EPOCHS} [Train]')
     for batch_idx, (images, labels) in enumerate(pbar):
         images = images.to(device, non_blocking=True)
-        encoded_labels, label_lengths = encode_labels(labels, char_to_idx)
-        encoded_labels = encoded_labels.to(device, non_blocking=True)
+        targets = encode_labels(labels, char_to_idx, config.CAPTCHA_LENGTH).to(
+            device, non_blocking=True
+        )
 
         if use_amp:
             with autocast('cuda'):
-                outputs = model(images)
+                logits = model(images)
+                loss = _multihead_loss(logits.float(), targets, criterion)
         else:
-            outputs = model(images)
-
-        # CTC loss must run in FP32 to avoid numerical overflow / nan.
-        log_probs = torch.nn.functional.log_softmax(outputs.float(), dim=2)
-        input_lengths = torch.full(
-            size=(images.size(0),),
-            fill_value=outputs.size(0),
-            dtype=torch.long,
-            device=device,
-        )
-        loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
+            logits = model(images)
+            loss = _multihead_loss(logits, targets, criterion)
 
         # Defensive guard: if loss is non-finite (e.g. due to a degenerate
         # batch), skip this step entirely so a single bad batch can't poison
@@ -197,10 +215,9 @@ def train_epoch(model, train_loader, optimizer, criterion, scaler, device,
 
         running_loss += loss.item()
 
-        preds = decode_predictions(outputs, idx_to_char)
-        for p, t in zip(preds, labels):
-            correct += int(p == t)
-            total += 1
+        c, n = _accuracy(logits.detach(), targets)
+        correct += c
+        total += n
 
         if batch_idx % 10 == 0:
             pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{correct / max(total, 1):.4f}'})
@@ -233,26 +250,20 @@ def validate_epoch(model, val_loader, criterion, device, char_to_idx, idx_to_cha
     with torch.no_grad():
         for batch_idx, (images, labels) in enumerate(pbar):
             images = images.to(device, non_blocking=True)
-            encoded_labels, label_lengths = encode_labels(labels, char_to_idx)
-            encoded_labels = encoded_labels.to(device, non_blocking=True)
-
-            outputs = model(images)
-            log_probs = torch.nn.functional.log_softmax(outputs.float(), dim=2)
-            input_lengths = torch.full(
-                size=(images.size(0),),
-                fill_value=outputs.size(0),
-                dtype=torch.long,
-                device=device,
+            targets = encode_labels(labels, char_to_idx, config.CAPTCHA_LENGTH).to(
+                device, non_blocking=True
             )
-            loss = criterion(log_probs, encoded_labels, input_lengths, label_lengths)
+
+            logits = model(images)
+            loss = _multihead_loss(logits.float(), targets, criterion)
             running_loss += loss.item()
 
-            preds = decode_predictions(outputs, idx_to_char)
+            preds = decode_predictions(logits, idx_to_char)
             all_preds.extend(preds)
             all_labels.extend(labels)
-            for p, t in zip(preds, labels):
-                correct += int(p == t)
-                total += 1
+            c, n = _accuracy(logits, targets)
+            correct += c
+            total += n
 
             if batch_idx % 10 == 0:
                 pbar.set_postfix({'loss': f'{loss.item():.4f}', 'acc': f'{correct / max(total, 1):.4f}'})
@@ -294,12 +305,7 @@ def _train_one_variant(rank, world_size, gpu, variant, args):
     logger = setup_logger(log_name, log_file)
 
     # Model
-    num_classes = config.NUM_CHARS + 1  # + CTC blank
-    model = build_model(
-        variant,
-        num_classes=num_classes,
-        pretrained=getattr(args, 'pretrained', True),
-    ).to(device)
+    model = build_model(variant).to(device)
 
     if rank == 0:
         logger.info(
@@ -331,11 +337,13 @@ def _train_one_variant(rank, world_size, gpu, variant, args):
         step_size=config.LR_SCHEDULER_STEP,
         gamma=config.LR_SCHEDULER_GAMMA,
     )
-    criterion = nn.CTCLoss(blank=config.NUM_CHARS, reduction='mean', zero_infinity=True)
+    # Per-position cross-entropy. We pass ``reduction='mean'`` and multiply by
+    # the number of positions inside ``_multihead_loss`` so the gradient is
+    # equivalent to the sum of 4 independent CE losses.
+    criterion = nn.CrossEntropyLoss(reduction='mean')
 
     char_to_idx = {ch: i for i, ch in enumerate(config.CHARS)}
     idx_to_char = {i: ch for i, ch in enumerate(config.CHARS)}
-    idx_to_char[config.NUM_CHARS] = ''  # blank
 
     train_loader, val_loader, train_sampler, val_sampler = get_data_loaders(
         config.DATA_DIR,
@@ -359,7 +367,7 @@ def _train_one_variant(rank, world_size, gpu, variant, args):
                 'swanlab is not installed. Run `pip install swanlab` to enable '
                 'experiment tracking, or pass --swanlab-mode disabled to silence.'
             )
-        swanlab_run = _swanlab_init(args, model, num_classes, variant)
+        swanlab_run = _swanlab_init(args, model, variant)
         if swanlab_run is not None:
             logger.info(f'SwanLab tracking enabled (mode={args.swanlab_mode}).')
         else:
@@ -596,7 +604,7 @@ def main():
     parser.add_argument('--variants', default='',
                         help='Comma-separated list of variants to train, or "all". '
                              'Overrides --variant when provided. '
-                             'Example: --variants tiny,small,medium,large')
+                             'Example: --variants nano,tiny,small,medium,large')
     parser.add_argument('--parallel-variants', action='store_true',
                         help='Train multiple variants concurrently, one per GPU. '
                              'Each variant uses a single GPU (no DDP). '
@@ -612,9 +620,6 @@ def main():
     # Misc
     parser.add_argument('--seed', default=42, type=int, help='Random seed')
     parser.add_argument('--resume', default='', type=str, help='Path to checkpoint to resume from')
-    parser.add_argument('--no-pretrained', dest='pretrained', action='store_false',
-                        help='Skip downloading ImageNet-pretrained ResNet-18 weights (large variant only).')
-    parser.set_defaults(pretrained=True)
 
     # Early stopping
     parser.add_argument('--patience', type=int, default=8,
