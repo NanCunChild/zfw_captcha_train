@@ -496,6 +496,12 @@ def _train_one_variant(rank, world_size, gpu, variant, args):
 # Launchers
 # ---------------------------------------------------------------------------
 
+def _ddp_spawn_worker(gpu, ngpus_per_node, args, variant):
+    """Top-level worker for mp.spawn (must be picklable)."""
+    rank = args.node_rank * ngpus_per_node + gpu
+    _train_one_variant(rank, args.world_size, gpu, variant, args)
+
+
 def _ddp_launch_one_variant(variant: str, args, ngpus_per_node: int) -> None:
     """Train a single variant using DDP across all available GPUs."""
     args.world_size = max(args.nodes * ngpus_per_node, 1)
@@ -505,11 +511,11 @@ def _ddp_launch_one_variant(variant: str, args, ngpus_per_node: int) -> None:
         _train_one_variant(rank=0, world_size=1, gpu=gpu, variant=variant, args=args)
         return
 
-    def _worker(gpu, ngpus, args_, variant_):
-        rank = args_.node_rank * ngpus + gpu
-        _train_one_variant(rank, args_.world_size, gpu, variant_, args_)
-
-    mp.spawn(_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args, variant))
+    mp.spawn(
+        _ddp_spawn_worker,
+        nprocs=ngpus_per_node,
+        args=(ngpus_per_node, args, variant),
+    )
 
 
 def _parallel_pool_worker(gpu_id, variants_to_run, args):
