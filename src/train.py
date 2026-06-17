@@ -8,15 +8,13 @@ terms. No CTC, no RNN.
 Pick a model size with ``--variant``:
 
     python src/train.py --variant nano      # < 100 KB
-    python src/train.py --variant tiny      # < 500 KB (default)
-    python src/train.py --variant small     # ~ 800 KB
-    python src/train.py --variant medium    # ~ 2.6 MB
-    python src/train.py --variant large     # ~ 5.4 MB
+    python src/train.py --variant small     # < 500 KB (default)
+    python src/train.py --variant full      # ~ 800 KB
 
 You can also produce several artifacts in a single command:
 
     # Sequential (each variant uses every available GPU via DDP):
-    python src/train.py --variants nano,tiny,small,medium,large
+    python src/train.py --variants nano,small,full
 
     # Fully parallel (one variant per GPU, run concurrently):
     python src/train.py --variants all --parallel-variants
@@ -604,7 +602,7 @@ def main():
     parser.add_argument('--variants', default='',
                         help='Comma-separated list of variants to train, or "all". '
                              'Overrides --variant when provided. '
-                             'Example: --variants nano,tiny,small,medium,large')
+                             'Example: --variants nano,small,full')
     parser.add_argument('--parallel-variants', action='store_true',
                         help='Train multiple variants concurrently, one per GPU. '
                              'Each variant uses a single GPU (no DDP). '

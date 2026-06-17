@@ -30,12 +30,10 @@ LR_SCHEDULER_GAMMA = 0.5
 # Available variants (defined in src/model.py). All are pure CNN with 4
 # independent classification heads (one per digit position).
 #   "nano"   ~  85 KB   absolute minimum (< 100 KB)
-#   "tiny"   ~ 385 KB   default lightweight
-#   "small"  ~ 785 KB
-#   "medium" ~ 2.6 MB
-#   "large"  ~ 5.4 MB
-DEFAULT_VARIANT = 'tiny'
-VARIANTS = ('nano', 'tiny', 'small', 'medium', 'large')
+#   "small"  ~ 385 KB   default lightweight
+#   "full"   ~ 785 KB
+DEFAULT_VARIANT = 'small'
+VARIANTS = ('nano', 'small', 'full')
 
 # ---------------------------------------------------------------------------
 # SwanLab monitoring

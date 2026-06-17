@@ -2,7 +2,7 @@
 """Evaluate a trained captcha model on the validation split.
 
 Usage:
-    python src/evaluate.py --variant tiny --model-path checkpoints/tiny/final_model.pth
+    python src/evaluate.py --variant small --model-path checkpoints/small/final_model.pth
 """
 
 from __future__ import annotations

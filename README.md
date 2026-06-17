@@ -2,6 +2,8 @@
 
 纯 CNN 的 4 位数字验证码识别项目（针对学校自服务平台），使用 4 个独立分类头（每位数字一个），训练采用 CrossEntropyLoss。支持多种模型规格，方便按部署场景选用合适大小的 `.pth` 权重文件。
 
+本项目引入了swanlab监测，训练情况见链接 [Swanlab zfw_captcha_training](https://swanlab.cn/@nancunchild/zfw_captcha_train?utm_source=website_qr&utm_medium=qr_scan)
+
 > **设计决策**：验证码为固定 4 位、位置基本固定的纯数字，不存在变长对齐问题，因此不需要 RNN/CTC。早期版本曾使用 CRNN + CTC，但引入了不必要的复杂度和数值稳定性问题，已在 `3aeb432` 中移除。
 
 > **训练监控**：全面接入 [SwanLab](https://swanlab.cn/)，指标、学习率、预测样图等都会推送到 SwanLab。
@@ -12,15 +14,13 @@
 
 ## 1. 模型规格（`--variant`）
 
-代码内置五档模型，对应不同的参数量和 `pth` 文件体积：
+代码内置三档模型，对应不同的参数量和 `pth` 文件体积：
 
 | variant   | 参数量      | 保存的 `.pth` 大小 | 适用场景                       |
 | --------- | ----------- | -------------------- | ------------------------------ |
 | `nano`    | ~ 21K       | **约 85 KB**         | 极致压缩（< 100 KB 硬限制）    |
-| `tiny`    | ~ 96K       | **约 385 KB**        | 边缘设备 / 浏览器端 / 极致轻量 |
-| `small`   | ~ 196K      | **约 785 KB**        | 移动端 / 嵌入式               |
-| `medium`  | ~ 655K      | **约 2.6 MB**        | 普通服务端，速度与精度平衡     |
-| `large`   | ~ 1.36M     | **约 5.4 MB**        | 追求最高精度                   |
+| `small`   | ~ 96K       | **约 385 KB**        | 边缘设备 / 浏览器端 / 轻量部署（默认） |
+| `full`    | ~ 196K      | **约 785 KB**        | 追求最高精度                   |
 
 > 模型实现见 [`src/model.py`](src/model.py) 中的 `CaptchaCNN` 类，通过 `build_model(variant)` 工厂函数构造。架构为多层 3×3 Conv + BN + ReLU，经 `AdaptiveAvgPool2d((1, 4))` 坍缩为 4 列特征，每列接一个独立线性分类头输出 10 类（0-9）。
 
@@ -69,10 +69,8 @@ data/captcha_get/
 
 ```bash
 python src/train.py --variant nano      # ~85KB
-python src/train.py --variant tiny      # ~385KB (默认)
-python src/train.py --variant small     # ~785KB
-python src/train.py --variant medium    # ~2.6MB
-python src/train.py --variant large     # ~5.4MB
+python src/train.py --variant small     # ~385KB (默认)
+python src/train.py --variant full      # ~785KB
 ```
 
 权重保存到：
@@ -88,30 +86,29 @@ checkpoints/<variant>/final_model.pth     # 训练结束时的纯权重，可直
 
 ```bash
 # 顺序训练：每个变体依次训练，每个都吃满全部 GPU（DDP）
-python src/train.py --variants nano,tiny,small,medium,large
+python src/train.py --variants nano,small,full
 
 # 等价写法
 python src/train.py --variants all
 
 # 双卡并行：每个变体独占一张 GPU 同时训练
-# （4 个变体 + 2 GPU 时，2 个先并发跑，剩下 2 个排队，每张卡 sequentialize）
 python src/train.py --variants all --parallel-variants
 ```
 
-两种模式对比（双卡 + 4 变体）：
+两种模式对比（双卡 + 3 变体）：
 
 | 模式 | 命令开关 | 单变体训练时间 | 总耗时（粗估） | 备注 |
 | ---- | --------- | -------------- | --------------- | ---- |
-| 顺序 | 默认 | T / 1.8（DDP 加速） | **≈ 2.22 T** | 每个变体都用全部 GPU |
+| 顺序 | 默认 | T / 1.8（DDP 加速） | **≈ 1.67 T** | 每个变体都用全部 GPU |
 | 并行 | `--parallel-variants` | T（单卡） | **≈ 2 T** | 每变体独占 1 张卡 |
 
-> 一般情况下两种模式总耗时差异不大，并行模式略快（~10%）。优先用 `--parallel-variants` 的场景是：变体数 ≤ GPU 数（如 2 个变体 + 2 张卡，可以真正同时跑完）。
+> 变体数 ≤ GPU 数时（如 3 个变体 + 4 张卡），`--parallel-variants` 可以真正同时跑完。
 
 ### 早停（`--patience`）
 
 ```bash
-python src/train.py --variant tiny --patience 8       # 默认值
-python src/train.py --variant tiny --patience 0       # 关闭早停
+python src/train.py --variant small --patience 8       # 默认值
+python src/train.py --variant small --patience 0       # 关闭早停
 ```
 
 逻辑：如果验证集准确率连续 N 个 epoch 没刷新最高值，立即结束训练（DDP 模式下会广播停止信号给所有 rank）。`best_model.pth` 永远保留历史最优。
@@ -146,13 +143,13 @@ python src/train.py --variant tiny --patience 0       # 关闭早停
 例如：完全离线训练，但仍想保留训练日志：
 
 ```bash
-python src/train.py --variant tiny --swanlab-mode offline
+python src/train.py --variant small --swanlab-mode offline
 ```
 
 不希望使用 SwanLab 时：
 
 ```bash
-python src/train.py --variant tiny --swanlab-mode disabled
+python src/train.py --variant small --swanlab-mode disabled
 ```
 
 会被记录到 SwanLab 的内容包括：
@@ -169,9 +166,9 @@ python src/train.py --variant tiny --swanlab-mode disabled
 ## 6. 评估
 
 ```bash
-python src/evaluate.py --variant tiny
+python src/evaluate.py --variant small
 # 或指定权重路径
-python src/evaluate.py --variant small --model-path checkpoints/small/final_model.pth
+python src/evaluate.py --variant full --model-path checkpoints/full/final_model.pth
 ```
 
 输出会打印对应模型在验证集上的整体准确率（按整张验证码完全正确为标准）。
@@ -213,7 +210,7 @@ python src/evaluate.py --variant small --model-path checkpoints/small/final_mode
 **主要改动**：
 - **架构简化**：移除 RNN/LSTM 和 CTC，改为 AdaptiveAvgPool + 多头分类，代码量和 debug 难度大幅下降。
 - **监控平台**：移除了 TensorBoard / 本地 HTML 监控，统一改用 SwanLab。
-- **模型选择**：提供 `nano / tiny / small / medium / large` 五档大小。
+- **模型选择**：提供 `nano / small / full` 三档大小。
 - **多产物**：`--variants` 一次训多个变体，可选 `--parallel-variants` 多卡并发。
 - **早停**：`--patience` 默认 8 epoch。
 - **性能**：默认开启 TF32 / cudnn.benchmark / Fused Adam / DDP static_graph / persistent_workers。

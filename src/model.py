@@ -10,9 +10,8 @@ one classification head per digit position. Training uses the sum of 4
 Variants:
 
 * ``nano``   ~ 21K params  (~85 KB on disk, hard < 100 KB)
-* ``tiny``   ~ 96K params  (~385 KB,  < 500 KB)
-* ``small``  ~ 196K params (~785 KB)
-* ``large``  ~ 1.36M params (~5.4 MB)
+* ``small``  ~ 96K params  (~385 KB,  < 500 KB)
+* ``full``   ~ 196K params (~785 KB)
 """
 
 from __future__ import annotations
@@ -33,21 +32,13 @@ MODEL_CONFIGS: dict[str, dict[str, Sequence]] = {
         "channels": [10, 20, 32, 40],
         "pools":    [True, True, True, False],
     },
-    "tiny": {
+    "small": {
         "channels": [16, 32, 48, 64, 80],
         "pools":    [True, True, True, False, False],
     },
-    "small": {
+    "full": {
         "channels": [24, 48, 64, 96, 112],
         "pools":    [True, True, True, False, False],
-    },
-    "medium": {
-        "channels": [32, 64, 96, 128, 160, 192],
-        "pools":    [True, True, True, False, False, False],
-    },
-    "large": {
-        "channels": [32, 64, 128, 192, 256, 256],
-        "pools":    [True, True, True, False, False, False],
     },
 }
 
@@ -71,7 +62,7 @@ class CaptchaCNN(nn.Module):
 
     def __init__(
         self,
-        variant: str = "tiny",
+        variant: str = "small",
         num_positions: int = NUM_POSITIONS,
         num_digits: int = NUM_DIGITS,
     ) -> None:
