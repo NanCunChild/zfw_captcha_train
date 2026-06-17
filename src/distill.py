@@ -116,14 +116,15 @@ def train_distill(args):
     logger = setup_logger('distill', 'logs/distill.log')
 
     teacher = build_model(args.teacher_variant).to(device)
-    state_dict = torch.load(args.teacher_path, map_location=device)
+    teacher_total_params = sum(p.numel() for p in teacher.parameters())
+    state_dict = torch.load(args.teacher_path, map_location=device, weights_only=True)
     if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
         state_dict = state_dict['model_state_dict']
     teacher.load_state_dict(state_dict)
     teacher.eval()
     for p in teacher.parameters():
         p.requires_grad = False
-    logger.info(f'Teacher loaded: {args.teacher_variant} ({count_parameters(teacher):,} params)')
+    logger.info(f'Teacher loaded: {args.teacher_variant} ({teacher_total_params:,} params, frozen)')
 
     if args.student_channels:
         student = build_custom_student(args.student_channels).to(device)
@@ -142,9 +143,21 @@ def train_distill(args):
     char_to_idx = {ch: i for i, ch in enumerate(config.CHARS)}
     idx_to_char = {i: ch for i, ch in enumerate(config.CHARS)}
 
+    data_dir = args.data_dir
+    if not os.path.isdir(data_dir):
+        raise FileNotFoundError(
+            f'Data directory not found: {data_dir}\n'
+            f'Please provide the correct path via --data-dir or set config.DATA_DIR.'
+        )
+
     train_loader, val_loader, _, _ = get_data_loaders(
-        config.DATA_DIR, args.batch_size, num_workers=4
+        data_dir, args.batch_size, num_workers=4
     )
+    if len(train_loader.dataset) == 0:
+        raise RuntimeError(
+            f'Training dataset is empty. Check that {data_dir} contains '
+            f'subdirectories named with captcha labels (e.g. "0123/").'
+        )
 
     swanlab_run = None
     if swanlab is not None and args.swanlab_mode != 'disabled':
@@ -288,6 +301,9 @@ def main():
     parser.add_argument('--student-channels', default=None,
                         help='Custom student channel config (e.g. "8,16,24" or "6,12,20,28"). '
                              'Overrides --student-variant.')
+
+    parser.add_argument('--data-dir', default=config.DATA_DIR,
+                        help='Path to data directory (default: config.DATA_DIR)')
 
     parser.add_argument('--temperature', type=float, default=4.0,
                         help='Distillation temperature (higher = softer distribution)')

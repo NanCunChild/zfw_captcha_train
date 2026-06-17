@@ -216,6 +216,7 @@ python src/evaluate.py --variant full --model-path checkpoints/full/final_model.
 │   ├── train.py             # 训练入口（接入 SwanLab，支持多变体并行/顺序）
 │   ├── distill.py           # 知识蒸馏（教师 → 学生）
 │   ├── evaluate.py          # 评估脚本
+│   ├── label_tool.py        # 人工标注工具（处理 Unknown_* 目录）
 │   └── utils.py             # 编解码 / checkpoint / 可视化等辅助函数
 └── checkpoints/<variant>/   # 训练产物
 ```

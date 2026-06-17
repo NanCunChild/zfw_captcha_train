@@ -3,3 +3,4 @@ checkpoints/
 src/__pycache__/
 logs/
 __pycache__/
+.venv/
