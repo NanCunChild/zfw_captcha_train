@@ -29,11 +29,12 @@ LR_SCHEDULER_GAMMA = 0.5
 # ---------------------------------------------------------------------------
 # Available variants (defined in src/model.py). All are pure CNN with 4
 # independent classification heads (one per digit position).
+#   "micro"  ~  24 KB   distillation target (experimental)
 #   "nano"   ~  85 KB   absolute minimum (< 100 KB)
 #   "small"  ~ 385 KB   default lightweight
 #   "full"   ~ 785 KB
 DEFAULT_VARIANT = 'small'
-VARIANTS = ('nano', 'small', 'full')
+VARIANTS = ('micro', 'nano', 'small', 'full')
 
 # ---------------------------------------------------------------------------
 # SwanLab monitoring

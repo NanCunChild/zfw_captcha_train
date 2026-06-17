@@ -9,6 +9,7 @@ one classification head per digit position. Training uses the sum of 4
 
 Variants:
 
+* ``micro``  ~ 6K params   (~24 KB on disk, distillation target)
 * ``nano``   ~ 21K params  (~85 KB on disk, hard < 100 KB)
 * ``small``  ~ 96K params  (~385 KB,  < 500 KB)
 * ``full``   ~ 196K params (~785 KB)
@@ -28,6 +29,10 @@ import torch.nn as nn
 # spatial map, which the final adaptive average pool collapses to (1, 4) --
 # one feature column per digit.
 MODEL_CONFIGS: dict[str, dict[str, Sequence]] = {
+    "micro": {
+        "channels": [8, 16, 24],
+        "pools":    [True, True, True],
+    },
     "nano": {
         "channels": [10, 20, 32, 40],
         "pools":    [True, True, True, False],

@@ -14,10 +14,11 @@
 
 ## 1. 模型规格（`--variant`）
 
-代码内置三档模型，对应不同的参数量和 `pth` 文件体积：
+代码内置四档模型，对应不同的参数量和 `pth` 文件体积：
 
 | variant   | 参数量      | 保存的 `.pth` 大小 | 适用场景                       |
 | --------- | ----------- | -------------------- | ------------------------------ |
+| `micro`   | ~ 6K        | **约 24 KB**         | 蒸馏实验目标，极限压缩          |
 | `nano`    | ~ 21K       | **约 85 KB**         | 极致压缩（< 100 KB 硬限制）    |
 | `small`   | ~ 96K       | **约 385 KB**        | 边缘设备 / 浏览器端 / 轻量部署（默认） |
 | `full`    | ~ 196K      | **约 785 KB**        | 追求最高精度                   |
@@ -68,6 +69,7 @@ data/captcha_get/
 ### 单变体
 
 ```bash
+python src/train.py --variant micro     # ~24KB (建议用蒸馏而非直接训练)
 python src/train.py --variant nano      # ~85KB
 python src/train.py --variant small     # ~385KB (默认)
 python src/train.py --variant full      # ~785KB
@@ -87,6 +89,7 @@ checkpoints/<variant>/final_model.pth     # 训练结束时的纯权重，可直
 ```bash
 # 顺序训练：每个变体依次训练，每个都吃满全部 GPU（DDP）
 python src/train.py --variants nano,small,full
+# micro 建议通过蒸馏获得，直接训练效果可能不佳
 
 # 等价写法
 python src/train.py --variants all
@@ -163,7 +166,33 @@ python src/train.py --variant small --swanlab-mode disabled
 
 ---
 
-## 6. 评估
+## 6. 知识蒸馏
+
+用已训练好的 `small` 模型作为教师，蒸馏到更小的学生模型：
+
+```bash
+# 蒸馏到 nano（默认）
+python src/distill.py --teacher-path checkpoints/small/final_model.pth
+
+# 蒸馏到 micro（~24KB，极限压缩）
+python src/distill.py --teacher-path checkpoints/small/final_model.pth --student-variant micro
+
+# 自定义学生通道数（实验不同的压缩比）
+python src/distill.py --teacher-path checkpoints/small/final_model.pth --student-channels 6,12,20
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--temperature` | 4.0 | 蒸馏温度，越高教师输出越平滑 |
+| `--alpha` | 0.7 | KD loss 权重（1-alpha 为硬标签 CE 权重） |
+| `--epochs` | 80 | 蒸馏轮数（通常需要比直接训练更多轮） |
+| `--patience` | 15 | 早停耐心值 |
+
+蒸馏产物保存在 `checkpoints/distill-<student>/`。
+
+---
+
+## 7. 评估
 
 ```bash
 python src/evaluate.py --variant small
@@ -175,7 +204,7 @@ python src/evaluate.py --variant full --model-path checkpoints/full/final_model.
 
 ---
 
-## 7. 项目结构
+## 8. 项目结构
 
 ```
 .
@@ -185,6 +214,7 @@ python src/evaluate.py --variant full --model-path checkpoints/full/final_model.
 │   ├── model.py             # CaptchaCNN + build_model() 工厂（纯 CNN，4 分类头）
 │   ├── dataset.py           # 数据集加载（含 DDP 采样器、persistent_workers）
 │   ├── train.py             # 训练入口（接入 SwanLab，支持多变体并行/顺序）
+│   ├── distill.py           # 知识蒸馏（教师 → 学生）
 │   ├── evaluate.py          # 评估脚本
 │   └── utils.py             # 编解码 / checkpoint / 可视化等辅助函数
 └── checkpoints/<variant>/   # 训练产物
@@ -192,7 +222,7 @@ python src/evaluate.py --variant full --model-path checkpoints/full/final_model.
 
 ---
 
-## 8. 常见问题排查
+## 9. 常见问题排查
 
 - **训练 loss 一开始就是 NaN**：代码已内置非有限 loss 跳过机制和梯度裁剪（max_norm=5.0）。如仍出现，请检查标签是否包含非数字字符或长度不为 4。
 - **CUDA out of memory**：把 `config.BATCH_SIZE` 调小，或切到更小的 variant。
@@ -200,7 +230,7 @@ python src/evaluate.py --variant full --model-path checkpoints/full/final_model.
 
 ---
 
-## 9. 架构演进记录
+## 10. 架构演进记录
 
 | 阶段 | 架构 | 损失函数 | 问题 |
 |------|------|----------|------|
@@ -210,7 +240,7 @@ python src/evaluate.py --variant full --model-path checkpoints/full/final_model.
 **主要改动**：
 - **架构简化**：移除 RNN/LSTM 和 CTC，改为 AdaptiveAvgPool + 多头分类，代码量和 debug 难度大幅下降。
 - **监控平台**：移除了 TensorBoard / 本地 HTML 监控，统一改用 SwanLab。
-- **模型选择**：提供 `nano / small / full` 三档大小。
+- **模型选择**：提供 `micro / nano / small / full` 四档大小（micro 为蒸馏实验用）。
 - **多产物**：`--variants` 一次训多个变体，可选 `--parallel-variants` 多卡并发。
 - **早停**：`--patience` 默认 8 epoch。
 - **性能**：默认开启 TF32 / cudnn.benchmark / Fused Adam / DDP static_graph / persistent_workers。
