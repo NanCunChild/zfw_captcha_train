@@ -1,25 +1,28 @@
 # zfw_captcha_train
 
-基于 CRNN（CNN + 双向 LSTM + CTC）的数字验证码识别项目，支持多种模型规格，方便在不同部署场景下选用合适大小的 `.pth` 权重文件。
+纯 CNN 的 4 位数字验证码识别项目（针对学校自服务平台），使用 4 个独立分类头（每位数字一个），训练采用 CrossEntropyLoss。支持多种模型规格，方便按部署场景选用合适大小的 `.pth` 权重文件。
 
-> 🆕 **本次更新：训练监控全面接入 [SwanLab](https://swanlab.cn/)**，替换掉了原先的本地 TensorBoard + HTML 监控页面。指标、学习率、预测样图等都会推送到 SwanLab，无需再手动开 `8080` 端口或浏览器查看本地静态页。
+> **设计决策**：验证码为固定 4 位、位置基本固定的纯数字，不存在变长对齐问题，因此不需要 RNN/CTC。早期版本曾使用 CRNN + CTC，但引入了不必要的复杂度和数值稳定性问题，已在 `3aeb432` 中移除。
 
-> 🆕 **新增功能**：早停（`--patience`）、一次训练多个变体（`--variants tiny,small,medium,large`）、双卡并行训练多变体（`--parallel-variants`）、TF32 / Fused Adam / DDP 优化等。
+> **训练监控**：全面接入 [SwanLab](https://swanlab.cn/)，指标、学习率、预测样图等都会推送到 SwanLab。
+
+> **其他功能**：早停（`--patience`）、一次训练多个变体（`--variants`）、双卡并行训练多变体（`--parallel-variants`）、TF32 / Fused Adam / DDP 优化等。
 
 ---
 
 ## 1. 模型规格（`--variant`）
 
-代码内置四档模型，对应不同的 `pth` 文件体积，供你按需训练 / 部署：
+代码内置五档模型，对应不同的参数量和 `pth` 文件体积：
 
 | variant   | 参数量      | 保存的 `.pth` 大小 | 适用场景                       |
 | --------- | ----------- | -------------------- | ------------------------------ |
-| `tiny`    | ~ 0.27 M    | **约 1 MB**          | 边缘设备 / 浏览器端 / 极致轻量 |
-| `small`   | ~ 0.79 M    | **约 3 MB**          | 移动端 / 嵌入式               |
-| `medium`  | ~ 2.56 M    | **约 10 MB**         | 普通服务端，速度与精度平衡     |
-| `large`   | ~ 14.34 M   | **约 55 MB（无上限）** | 追求最高精度，使用 ResNet-18 主干 |
+| `nano`    | ~ 21K       | **约 85 KB**         | 极致压缩（< 100 KB 硬限制）    |
+| `tiny`    | ~ 96K       | **约 385 KB**        | 边缘设备 / 浏览器端 / 极致轻量 |
+| `small`   | ~ 196K      | **约 785 KB**        | 移动端 / 嵌入式               |
+| `medium`  | ~ 655K      | **约 2.6 MB**        | 普通服务端，速度与精度平衡     |
+| `large`   | ~ 1.36M     | **约 5.4 MB**        | 追求最高精度                   |
 
-> 模型实现见 [`src/model.py`](src/model.py) 中的 `LightCRNN`（tiny/small/medium）与 `CRNN`（large），统一通过 `build_model(variant, num_classes)` 工厂函数构造。
+> 模型实现见 [`src/model.py`](src/model.py) 中的 `CaptchaCNN` 类，通过 `build_model(variant)` 工厂函数构造。架构为多层 3×3 Conv + BN + ReLU，经 `AdaptiveAvgPool2d((1, 4))` 坍缩为 4 列特征，每列接一个独立线性分类头输出 10 类（0-9）。
 
 ---
 
@@ -65,10 +68,11 @@ data/captcha_get/
 ### 单变体
 
 ```bash
-python src/train.py --variant tiny      # ~1MB
-python src/train.py --variant small     # ~3MB
-python src/train.py --variant medium    # ~10MB
-python src/train.py --variant large     # 不限大小（ResNet-18 主干）
+python src/train.py --variant nano      # ~85KB
+python src/train.py --variant tiny      # ~385KB (默认)
+python src/train.py --variant small     # ~785KB
+python src/train.py --variant medium    # ~2.6MB
+python src/train.py --variant large     # ~5.4MB
 ```
 
 权重保存到：
@@ -84,7 +88,7 @@ checkpoints/<variant>/final_model.pth     # 训练结束时的纯权重，可直
 
 ```bash
 # 顺序训练：每个变体依次训练，每个都吃满全部 GPU（DDP）
-python src/train.py --variants tiny,small,medium,large
+python src/train.py --variants nano,tiny,small,medium,large
 
 # 等价写法
 python src/train.py --variants all
@@ -181,7 +185,7 @@ python src/evaluate.py --variant small --model-path checkpoints/small/final_mode
 ├── config.py                # 全局配置：数据路径、超参、变体列表、SwanLab 设置
 ├── requirements.txt
 ├── src/
-│   ├── model.py             # CRNN / LightCRNN + build_model() 工厂
+│   ├── model.py             # CaptchaCNN + build_model() 工厂（纯 CNN，4 分类头）
 │   ├── dataset.py           # 数据集加载（含 DDP 采样器、persistent_workers）
 │   ├── train.py             # 训练入口（接入 SwanLab，支持多变体并行/顺序）
 │   ├── evaluate.py          # 评估脚本
@@ -193,19 +197,24 @@ python src/evaluate.py --variant small --model-path checkpoints/small/final_mode
 
 ## 8. 常见问题排查
 
-- **训练 loss 一开始就是 NaN**：通常是 CTC `-inf` 引起。代码已默认开 `zero_infinity=True`（label 中含连续重复字符且序列长度不够时自动跳过），并把 CTC loss 强制 FP32。如果仍出现，请检查标签是否非数字。
+- **训练 loss 一开始就是 NaN**：代码已内置非有限 loss 跳过机制和梯度裁剪（max_norm=5.0）。如仍出现，请检查标签是否包含非数字字符或长度不为 4。
 - **CUDA out of memory**：把 `config.BATCH_SIZE` 调小，或切到更小的 variant。
-- **`large` 模型预训练权重下载失败**：加 `--no-pretrained` 跳过。
 - **多卡训练效率不高**：先确认 `nvidia-smi` 看 GPU 利用率；可尝试 `--num-workers 8 --prefetch-factor 8`，或加 `--sync-bn`。
 
 ---
 
-## 9. 与上一版的主要差异
+## 9. 架构演进记录
 
-- **监控平台**：移除了 `src/web_monitor.py`、`src/monitor.py`、`monitor_template.html` 与 TensorBoard，统一改用 SwanLab。
-- **模型选择**：新增 `--variant` 参数，提供 `tiny / small / medium / large` 四档大小。
-- **多产物**：新增 `--variants` 一次训多个变体，可选 `--parallel-variants` 多卡并发。
-- **早停**：新增 `--patience`，默认 8 epoch。
-- **性能**：默认开启 TF32 / cudnn.benchmark / Fused Adam / DDP static_graph / persistent_workers 等优化。
-- **数值稳定性**：CTC `zero_infinity=True`、loss 计算强制 FP32、梯度裁剪 5.0、跳过非有限 loss 的 batch。
-- **离线友好**：`large` 模型在无网环境下会自动回退到随机初始化，不再因为下载预训练权重失败而中断训练。
+| 阶段 | 架构 | 损失函数 | 问题 |
+|------|------|----------|------|
+| v1 (初始) | CRNN (CNN + BiLSTM + CTC) | CTCLoss | CTC NaN、blank token 处理复杂、对固定长度任务过度设计 |
+| v2 (当前) | 纯 CNN + 4 独立分类头 | CrossEntropyLoss × 4 | 无 |
+
+**主要改动**：
+- **架构简化**：移除 RNN/LSTM 和 CTC，改为 AdaptiveAvgPool + 多头分类，代码量和 debug 难度大幅下降。
+- **监控平台**：移除了 TensorBoard / 本地 HTML 监控，统一改用 SwanLab。
+- **模型选择**：提供 `nano / tiny / small / medium / large` 五档大小。
+- **多产物**：`--variants` 一次训多个变体，可选 `--parallel-variants` 多卡并发。
+- **早停**：`--patience` 默认 8 epoch。
+- **性能**：默认开启 TF32 / cudnn.benchmark / Fused Adam / DDP static_graph / persistent_workers。
+- **数值稳定性**：梯度裁剪 5.0、跳过非有限 loss 的 batch。
